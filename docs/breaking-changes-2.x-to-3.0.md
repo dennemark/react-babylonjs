@@ -53,7 +53,8 @@ import { Engine, Scene } from 'react-babylonjs';
 ```
 
 ## Hooks renamed `useBabylonScene` -> `useScene`, `useBabylonEngine` -> `useEngine` & `useBabylonCanvas` --> `useCanvas`
-`model` intrinsic host element has been removed in favour of a `Model` component (notice the lower case vs. proper case), which needs to be enclosed in `React.Suspense` Component.
+Hook to get scene, engine and canvas objects now have simpler names.
+
 **BEFORE:**
 ```jsx
 import { useBabylonScene, useBabylonEngine, useBabylonCanvas } from 'react-babylonjs';
