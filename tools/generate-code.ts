@@ -1,3 +1,4 @@
+import { exit } from 'process';
 /**
  * To debug code generation use the launch config in VS Code - "Generate Code (debug)"
  */
@@ -33,6 +34,7 @@ import {
   Node,
   SyntaxKind,
   FormatCodeSettings,
+  GetAccessorDeclaration,
 } from 'ts-morph'
 
 import { GeneratedParameter, CreateInfo, CreationType } from "../src/codeGenerationDescriptors";
@@ -48,6 +50,8 @@ type ClassNameSpaceTuple = {
   classDeclaration: ClassDeclaration,
   moduleDeclaration: ModuleDeclaration
 }
+
+const addedClassDeclarationsMap = new Map<string, ClassDeclaration>();
 
 // to set onXXX properties.  via onXXX.add(() => void).  TODO: use TypeGuards.isTypeReferenceNode(...) and check type
 const OBSERVABLE_PATTERN: RegExp = /^BabylonjsCoreObservable<.*>$/;
@@ -151,8 +155,12 @@ classesOfInterest.set("PhysicsImpostor", undefined);
 classesOfInterest.set("VRExperienceHelper", undefined);
 classesOfInterest.set("DynamicTerrain", undefined);
 classesOfInterest.set("EffectLayer", undefined);
-classesOfInterest.set("Behavior", undefined); // TODO: remove this.
+classesOfInterest.set("Behavior", undefined); // TODO: remove this and use interface
 classesOfInterest.set("PointsCloudSystem", undefined);
+classesOfInterest.set("PostProcessRenderPipeline", undefined);
+classesOfInterest.set("PostProcess", undefined);
+
+const readonlyPropertiesToGenerate: Map<string, ClassNameSpaceTuple> = new Map<string, ClassNameSpaceTuple>();
 
 const readonlyPropertiesToGenerate: Map<string, ClassNameSpaceTuple> = new Map<string, ClassNameSpaceTuple>();
 
@@ -414,22 +422,14 @@ const addMetadata = (classDeclaration: ClassDeclaration, originalClassDeclaratio
 const createdFactoryClasses: string[] = [];
 
 /**
- * Create Element from static factory function
- * @param factoryClassName
- * @param hostClassName
- * @param prefix
- * @param keepOriginName
- * @param metadata
- * @param generatedCodeSourceFile
- * @param generatedPropsSourceFile
+ * Create host element from class declaration static (creation) methods
  */
-const createFactoryClass = (factoryClassName: string, hostClassName: string, prefix: string, metadata: InstanceMetadataParameter, generatedCodeSourceFile: SourceFile, generatedPropsSourceFile: SourceFile) => {
+const createFactoryClass = (factoryClassName: string, prefix: string, metadata: InstanceMetadataParameter, generatedCodeSourceFile: SourceFile, generatedPropsSourceFile: SourceFile) => {
   let factoryBuilderTuple: ClassNameSpaceTuple = classesOfInterest.get(factoryClassName)!;
-  let hostTuple: ClassNameSpaceTuple = classesOfInterest.get(hostClassName)!;
 
   let factoryMethods: MethodDeclaration[] = factoryBuilderTuple.classDeclaration.getStaticMethods();
 
-  factoryMethods.forEach((method: MethodDeclaration) => {
+  for (const method of factoryMethods) {
     const methodName: string = method.getName();
     if (methodName && methodName.startsWith('Create') || methodName.startsWith('Extrude')) {
       let factoryType: string = methodName.startsWith('Create')
@@ -438,13 +438,17 @@ const createFactoryClass = (factoryClassName: string, hostClassName: string, pre
       factoryType = prefix + factoryType;
       createdFactoryClasses.push(factoryType);
 
-      addHostElement(factoryType, hostTuple.classDeclaration);
-      let newClassDeclaration: ClassDeclaration = addClassDeclarationFromFactoryMethod(generatedCodeSourceFile, factoryType, classesOfInterest.get(hostClassName)!.classDeclaration, method);
+      // [0] is always the ClassDeclaration (at least for MeshBuilder and AdvancedDynamicTexture factory methods)
+      const hostClassName = (method.getReturnType().getSymbol()!.getDeclarations()[0] as ClassDeclaration).getName()!;
+      const classDeclarationType = addedClassDeclarationsMap.get(hostClassName) ?? classesOfInterest.get(hostClassName)!.classDeclaration!;
+
+      addHostElement(factoryType, classDeclarationType);
+      let newClassDeclaration: ClassDeclaration = addClassDeclarationFromFactoryMethod(generatedCodeSourceFile, factoryType, classDeclarationType, method);
 
       addCreateInfoFromFactoryMethod(method, camelCase(factoryBuilderTuple.classDeclaration.getName()!), methodName, newClassDeclaration, "@babylonjs/core", generatedCodeSourceFile, generatedPropsSourceFile)
       addMetadata(newClassDeclaration, undefined /* no original class */, metadata)
     }
-  });
+  };
   console.log(`${factoryClassName} Factory - ${createdFactoryClasses.sort((a, b) => a.localeCompare(b)).map(c => classToIntrinsic(c).replace(/['\u2019]/g, '')).join(', ')}`);
 };
 
@@ -639,6 +643,23 @@ const getInstanceSetMethods = (classDeclaration: ClassDeclaration): MethodDeclar
   return instanceSetMethods;
 }
 
+function addReadonlyClasses(classDeclaration: ClassDeclaration, property: PropertyDeclaration | GetAccessorDeclaration): void {
+  if (property.getType().isClass() === true) {
+    const typeClassDeclarations: ClassDeclaration[] | undefined = property.getType()?.getSymbol()?.getDeclarations() as ClassDeclaration[];
+    const className = typeClassDeclarations !== undefined && typeClassDeclarations.length === 1
+      ? typeClassDeclarations[0].getName()
+      : undefined;
+    if (className !== undefined && className.endsWith('Configuration')) {
+      const classNamespaceTuple: ClassNameSpaceTuple = {
+        classDeclaration: typeClassDeclarations[0],
+        moduleDeclaration: getModuleDeclarationFromClassDeclaration(typeClassDeclarations[0])
+      };
+      console.log(` >> adding ${classDeclaration.getName()!}.${property.getName()} (read-only) property type '${typeClassDeclarations[0].getName()}'`);
+      readonlyPropertiesToGenerate.set(typeClassDeclarations[0].getName()!, classNamespaceTuple);
+    }
+  }
+}
+
 /**
  * get props from babylonjs class
  * @param classDeclaration
@@ -648,9 +669,14 @@ const getInstanceProperties = (classDeclaration: ClassDeclaration): (PropertyDec
 
   classDeclaration.getSetAccessors().forEach(acc => result.push(acc));
 
+  classDeclaration.getGetAccessors().forEach(acc => {
+    // This is how we add ImageProcessingConfiguration.
+    addReadonlyClasses(classDeclaration, acc);
+  });
+
   // for conditional breakpoints on class: classDeclaration.getName() === "Control";
   classDeclaration.getProperties().forEach(property => {
-    let propertyName = property.getName()
+    let propertyName = property.getName();
     if (propertyName[0] === '_') {
       // console.log(` > skipping ${className}.${propertyName} (private/hidden)`)
       return;
@@ -662,25 +688,15 @@ const getInstanceProperties = (classDeclaration: ClassDeclaration): (PropertyDec
     }
 
     if (property.isReadonly()) {
+      // This is how we add class configurations like PBRClearCoatConfiguration
       // console.log(` > skipping ${classDeclaration.getName()}.${propertyName} (read-only)`)
-      if (property.getType().isClass() === true) {
-        const typeClassDeclarations: ClassDeclaration[] | undefined = property.getType()?.getSymbol()?.getDeclarations() as ClassDeclaration[];
-        if (typeClassDeclarations !== undefined && typeClassDeclarations.length === 1) {
-          const classNamespaceTuple: ClassNameSpaceTuple = {
-            classDeclaration: typeClassDeclarations[0],
-            moduleDeclaration: getModuleDeclarationFromClassDeclaration(typeClassDeclarations[0])
-          };
-          // console.log(` >> adding ${classDeclaration.getName()}.${propertyName} (read-only) property type '${typeClassDeclarations[0].getName()}'`);
-          readonlyPropertiesToGenerate.set(typeClassDeclarations[0].getName()!, classNamespaceTuple);
-        }
-      }
+      addReadonlyClasses(classDeclaration, property);
       return;
     }
 
     // add conditional breakpoint to inspect properties.  ie: propertyName==='customShaderNameResolve'
     result.push(property);
   })
-
   return result;
 }
 
@@ -1351,6 +1367,7 @@ const createClassesInheritedFrom = (generatedCodeSourceFile: SourceFile, generat
     addMetadata(newClassDeclaration, derivedClassDeclaration, metadata);
 
     onAfterClassCreate && onAfterClassCreate(derivedClassDeclaration);
+    addedClassDeclarationsMap.set(derivedClassDeclaration.getName()!, derivedClassDeclaration);
   });
 
   console.log(`Building ${derivedClassesOrdered.size} ${baseClassName}s: ${(Array.from(derivedClassesOrdered.values())).map(c => c.getName()!).sort((a, b) => a.localeCompare(b)).map(c => classToIntrinsic(c)).join(', ')}`)
@@ -1534,7 +1551,6 @@ const generateCode = async () => {
   if (classesOfInterest.get("MeshBuilder") !== undefined) {
     createFactoryClass(
       "MeshBuilder",
-      "Mesh",
       "",
       {
         acceptsMaterials: true,
@@ -1549,7 +1565,6 @@ const generateCode = async () => {
   if (classesOfInterest.get("Material")) {
     createClassesInheritedFrom(generatedCodeSourceFile, generatedPropsSourceFile, classesOfInterest.get("Material")!, () => ({ isMaterial: true }));
   }
-
 
   if (classesOfInterest.get("Light")) {
     const fromClassName = (className: string): InstanceMetadataParameter => {
@@ -1580,7 +1595,6 @@ const generateCode = async () => {
     createClassesInheritedFrom(generatedCodeSourceFile, generatedPropsSourceFile, classesOfInterest.get("Control3D")!, () => ({ isGUI3DControl: true }));
   }
 
-
   if (classesOfInterest.get("EffectLayer")) {
     createClassesInheritedFrom(generatedCodeSourceFile, generatedPropsSourceFile, classesOfInterest.get("EffectLayer")!, () => ({ isEffectLayer: true }));
   }
@@ -1601,7 +1615,6 @@ const generateCode = async () => {
       if (classDeclaration.getName() === `${ClassNamesPrefix}AdvancedDynamicTexture`) {
         createFactoryClass(
           'AdvancedDynamicTexture',
-          'AdvancedDynamicTexture',
           'ADT',
           {
             isTexture: true,
@@ -1616,7 +1629,15 @@ const generateCode = async () => {
     createClassesInheritedFrom(generatedCodeSourceFile, generatedPropsSourceFile, classesOfInterest.get("ThinTexture")!, fromClassName, onTexturesCreate);
   }
 
-  console.log('Adding single glasses:');
+  if (classesOfInterest.get("PostProcessRenderPipeline")) {
+    createClassesInheritedFrom(generatedCodeSourceFile, generatedPropsSourceFile, classesOfInterest.get("PostProcessRenderPipeline")!, () => ({}));
+  }
+
+  if (classesOfInterest.get("PostProcess")) {
+    createClassesInheritedFrom(generatedCodeSourceFile, generatedPropsSourceFile, classesOfInterest.get("PostProcess")!, () => ({}));
+  }
+
+  console.log('Adding single classes:');
   createSingleClass("GUI3DManager", generatedCodeSourceFile, generatedPropsSourceFile, undefined, { isGUI3DControl: true }, () => { return; });
   createSingleClass("ShadowGenerator", generatedCodeSourceFile, generatedPropsSourceFile, undefined, { delayCreation: true }, () => { return; });
   createSingleClass("CascadedShadowGenerator", generatedCodeSourceFile, generatedPropsSourceFile, undefined, { delayCreation: true }, () => { return; });
@@ -1755,10 +1776,14 @@ const generateCode = async () => {
   await generatedPropsSourceFile.save();
 }
 
+console.time('total-duration');
 const result = generateCode();
 
 result.then(() => {
   console.log('completed without errors');
 }).catch(reason => {
   console.error('failed:', reason);
+}).finally(() => {
+  console.timeEnd('total-duration');
+  exit();
 })
